@@ -1,14 +1,8 @@
-const express = require('express');
+const http = require('http');
 const crypto = require('crypto');
 
-const app = express();
-app.use(express.json({ limit: '50mb' }));
-
-// In-memory store for frozen sessions
-// Maps freezeId -> { requestPayload, responsePayload, candidateMap }
+// In-memory store for frozen sessions: freezeId -> { canonicalReq, responsePayload, candidateMap }
 const freezeStore = new Map();
-
-// --- Helper Functions ---
 
 function utf8ByteLength(str) {
   return Buffer.byteLength(str, 'utf8');
@@ -52,30 +46,14 @@ function isNonEmptyString(val) {
   return typeof val === 'string' && val.trim().length > 0;
 }
 
-// --- Handler: POST /quantize ---
+function sendJson(res, statusCode, body) {
+  res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
 
-app.post('/quantize', (req, res) => {
-  const body = req.body;
-
-  if (!body || typeof body !== 'object' || Array.isArray(body) || !isNonEmptyString(body.phase)) {
-    return res.status(400).json({ error: 'INVALID_INPUT' });
-  }
-
-  if (body.phase === 'freeze') {
-    return handleFreeze(req, res, body);
-  } else if (body.phase === 'select') {
-    return handleSelect(req, res, body);
-  } else {
-    return res.status(400).json({ error: 'INVALID_INPUT' });
-  }
-});
-
-// --- Phase 1: Freeze ---
-
-function handleFreeze(req, res, body) {
+function handleFreeze(body, res) {
   const { freezeId, calibrationDigest, tokenizerDigest, allowedUnsupportedReasons, candidates } = body;
 
-  // Top-level validation
   if (
     !isNonEmptyString(freezeId) ||
     freezeId.length > 128 ||
@@ -85,39 +63,35 @@ function handleFreeze(req, res, body) {
     !Array.isArray(candidates) ||
     candidates.length === 0
   ) {
-    return res.status(400).json({ error: 'INVALID_INPUT' });
+    return sendJson(res, 400, { error: 'INVALID_INPUT' });
   }
 
-  // Check allowedUnsupportedReasons validity and uniqueness
   const allowedReasonsSet = new Set();
   for (const reason of allowedUnsupportedReasons) {
     if (!isNonEmptyString(reason) || allowedReasonsSet.has(reason)) {
-      return res.status(400).json({ error: 'INVALID_INPUT' });
+      return sendJson(res, 400, { error: 'INVALID_INPUT' });
     }
     allowedReasonsSet.add(reason);
   }
 
-  // Check candidate names uniqueness
   const candidateNamesSet = new Set();
   for (const c of candidates) {
     if (!c || typeof c !== 'object' || !isNonEmptyString(c.name) || candidateNamesSet.has(c.name)) {
-      return res.status(400).json({ error: 'INVALID_INPUT' });
+      return sendJson(res, 400, { error: 'INVALID_INPUT' });
     }
     candidateNamesSet.add(c.name);
   }
 
-  // Check replay conflict
   const canonicalReq = canonicalJsonStringify(body);
   if (freezeStore.has(freezeId)) {
     const existing = freezeStore.get(freezeId);
     if (existing.canonicalReq === canonicalReq) {
-      return res.status(200).json(existing.responsePayload);
+      return sendJson(res, 200, existing.responsePayload);
     } else {
-      return res.status(409).json({ error: 'FREEZE_ID_CONFLICT' });
+      return sendJson(res, 409, { error: 'FREEZE_ID_CONFLICT' });
     }
   }
 
-  // Process candidates
   const processedCandidates = [];
   const candidateMap = new Map();
 
@@ -128,7 +102,6 @@ function handleFreeze(req, res, body) {
     let packageDigest = null;
     let filesValid = true;
 
-    // Validate files structure
     if (!c.files || typeof c.files !== 'object' || Array.isArray(c.files) || Object.keys(c.files).length === 0) {
       filesValid = false;
     } else {
@@ -200,7 +173,6 @@ function handleFreeze(req, res, body) {
     candidateMap.set(c.name, processed);
   }
 
-  // Sort candidates by UTF-8 name
   processedCandidates.sort((a, b) => Buffer.from(a.name, 'utf8').compare(Buffer.from(b.name, 'utf8')));
 
   const responsePayload = {
@@ -214,15 +186,12 @@ function handleFreeze(req, res, body) {
     candidateMap: candidateMap
   });
 
-  return res.status(200).json(responsePayload);
+  return sendJson(res, 200, responsePayload);
 }
 
-// --- Phase 2: Select ---
-
-function handleSelect(req, res, body) {
+function handleSelect(body, res) {
   const { freezeId, candidates, policy, latencies, rows } = body;
 
-  // Validation of top-level select structure
   if (
     !isNonEmptyString(freezeId) ||
     !Array.isArray(candidates) ||
@@ -231,12 +200,11 @@ function handleSelect(req, res, body) {
     typeof policy !== 'object' ||
     Array.isArray(policy)
   ) {
-    return res.status(400).json({ error: 'INVALID_INPUT' });
+    return sendJson(res, 400, { error: 'INVALID_INPUT' });
   }
 
   const storedSession = freezeStore.get(freezeId) || null;
 
-  // Validate policy structure
   let policyValid = true;
   if (
     !Number.isSafeInteger(policy.maxBytes) ||
@@ -259,7 +227,6 @@ function handleSelect(req, res, body) {
     policyValid = false;
   }
 
-  // Validate policy.requiredSlices floors
   if (policyValid) {
     for (const [sName, sFloor] of Object.entries(policy.requiredSlices)) {
       if (!isNonEmptyString(sName) || typeof sFloor !== 'number' || !isFinite(sFloor) || sFloor < 0 || sFloor > 1) {
@@ -269,7 +236,6 @@ function handleSelect(req, res, body) {
     }
   }
 
-  // Check unique candidate names and match with candidateOrder
   const candidateNamesList = candidates.map(c => (c && typeof c === 'object' ? c.name : null));
   const candidateNamesSet = new Set(candidateNamesList);
 
@@ -295,7 +261,6 @@ function handleSelect(req, res, body) {
       rawCodes.push('INVALID_POLICY');
     }
 
-    // Lineage check
     let storedCandidate = null;
     if (!storedSession) {
       rawCodes.push('NOT_FROZEN');
@@ -304,14 +269,12 @@ function handleSelect(req, res, body) {
       if (!storedCandidate || storedCandidate.status !== 'frozen') {
         rawCodes.push('INVALID_LINEAGE');
       } else {
-        // Must match stored candidate structure exactly
         if (canonicalJsonStringify(c) !== canonicalJsonStringify(storedCandidate)) {
           rawCodes.push('INVALID_LINEAGE');
         }
       }
     }
 
-    // Manifest recomputation
     let recomputedBytes = null;
     let manifestValid = true;
 
@@ -340,14 +303,12 @@ function handleSelect(req, res, body) {
       recomputedBytes = null;
     }
 
-    // Latency check
     let candidateLatency = null;
     const latVal = latencies ? latencies[c.name] : undefined;
     if (typeof latVal === 'number' && isFinite(latVal) && latVal >= 0) {
       candidateLatency = latVal;
     }
 
-    // Predictions & Accuracy
     let aggregateAcc = null;
     let sliceAccs = null;
     let predictionsValid = true;
@@ -397,7 +358,6 @@ function handleSelect(req, res, body) {
       }
     }
 
-    // Floor and Limit evaluations
     if (policyValid && predictionsValid) {
       if (aggregateAcc !== null && aggregateAcc < policy.aggregateFloor) {
         rawCodes.push('AGGREGATE_FLOOR');
@@ -435,7 +395,6 @@ function handleSelect(req, res, body) {
     });
   }
 
-  // Sort results by policy.candidateOrder
   const orderMap = new Map();
   if (policyValid && policy.candidateOrder) {
     policy.candidateOrder.forEach((name, idx) => orderMap.set(name, idx));
@@ -448,7 +407,6 @@ function handleSelect(req, res, body) {
     return Buffer.from(a.name, 'utf8').compare(Buffer.from(b.name, 'utf8'));
   });
 
-  // Select Winner among admitted candidates
   const admittedResults = results.filter(r => r.admitted);
   let selected = null;
   let packageManifest = null;
@@ -469,7 +427,7 @@ function handleSelect(req, res, body) {
     }
   }
 
-  return res.status(200).json({
+  return sendJson(res, 200, {
     freezeId: freezeId,
     selected: selected,
     results: results,
@@ -477,7 +435,41 @@ function handleSelect(req, res, body) {
   });
 }
 
+const server = http.createServer((req, res) => {
+  if (req.method === 'POST' && req.url === '/quantize') {
+    let bodyData = '';
+    req.setEncoding('utf8');
+
+    req.on('data', chunk => {
+      bodyData += chunk;
+    });
+
+    req.on('end', () => {
+      let body;
+      try {
+        body = JSON.parse(bodyData);
+      } catch (e) {
+        return sendJson(res, 400, { error: 'INVALID_INPUT' });
+      }
+
+      if (!body || typeof body !== 'object' || Array.isArray(body) || !isNonEmptyString(body.phase)) {
+        return sendJson(res, 400, { error: 'INVALID_INPUT' });
+      }
+
+      if (body.phase === 'freeze') {
+        return handleFreeze(body, res);
+      } else if (body.phase === 'select') {
+        return handleSelect(body, res);
+      } else {
+        return sendJson(res, 400, { error: 'INVALID_INPUT' });
+      }
+    });
+  } else {
+    sendJson(res, 404, { error: 'NOT_FOUND' });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Quantize API listening on port ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
