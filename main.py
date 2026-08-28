@@ -1,4 +1,3 @@
-```python
 import hashlib
 import json
 import math
@@ -636,4 +635,3 @@ async def quantize(request: Request):
 @app.get("/")
 def root():
     return {"status": "ok"}
-```
